@@ -1,0 +1,5 @@
+[console_scripts]
+trady = src.interactive_cli:main
+trady-analysis = src.analysis.cli:main
+trady-data = src.data.cli:main
+trady-signals = src.signals.cli:main
