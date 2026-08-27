@@ -56,14 +56,14 @@ logger.debug(f"Performance: uvloop={'enabled' if _UVLOOP_AVAILABLE else 'disable
 # Goldsky API endpoint for Polymarket orderbook subgraph
 GOLDSKY_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
-# Rate limiting: 50 requests per 10 seconds
-RATE_LIMIT_REQUESTS = 50
+# Rate limiting: 500 requests per 10 seconds (allows ~50 req/sec)
+RATE_LIMIT_REQUESTS = 500
 RATE_LIMIT_WINDOW = 10  # seconds
 
 # Performance: Connection pool settings
-CONNECTION_POOL_LIMIT = 500  # Total connections
-CONNECTION_POOL_PER_HOST = 200  # Per-host connections
-CONCURRENT_REQUESTS = 100  # Semaphore limit
+CONNECTION_POOL_LIMIT = 100  # SAFE LIMIT for macOS
+CONNECTION_POOL_PER_HOST = 50  # Per-host connections
+CONCURRENT_REQUESTS = 50  # Semaphore limit - safe for stable fetching
 
 
 class GoldskyClient:
@@ -418,6 +418,129 @@ class GoldskyClient:
         logger.info(f"Total fetched (parallel): {len(all_events)} order filled events")
         return all_events
 
+    async def get_order_filled_events_parallel_generator(
+        self,
+        since_timestamp: int,
+        until_timestamp: int,
+        num_workers: int = 100,
+    ):
+        """
+        Fetch orderFilledEvents in parallel and yield batches as they complete.
+        
+        Uses a bounded queue to constrain memory usage and allow workers to
+        yield partial results immediately, providing smooth progress updates.
+        """
+        # Split time range into chunks
+        total_duration = until_timestamp - since_timestamp
+        chunk_duration = max(total_duration // num_workers, 1)
+
+        # Create time chunks
+        chunks = []
+        for i in range(num_workers):
+            chunk_start = since_timestamp + (i * chunk_duration)
+            chunk_end = since_timestamp + ((i + 1) * chunk_duration) if i < num_workers - 1 else until_timestamp
+            if chunk_start < until_timestamp:
+                chunks.append((chunk_start, chunk_end))
+
+        logger.info(f"Fetching stream in parallel with {len(chunks)} workers...")
+
+        # Bounded queue for backpressure
+        # Capacity: 50 batches * 1000 items/batch = ~50k items buffered max
+        queue = asyncio.Queue(maxsize=50) 
+        
+        async def fetch_worker(chunk_start: int, chunk_end: int):
+            """Fetch a single time chunk and put batches in queue."""
+            cursor_timestamp = str(chunk_start)
+
+            query_template = """
+            query OrderFilledEvents {{
+                orderFilledEvents(
+                    orderBy: timestamp
+                    orderDirection: asc
+                    first: {batch_size}
+                    where: {{timestamp_gt: "{cursor}", timestamp_lt: "{end}"}}
+                ) {{
+                    id
+                    timestamp
+                    transactionHash
+                    orderHash
+                    maker
+                    taker
+                    makerAssetId
+                    takerAssetId
+                    makerAmountFilled
+                    takerAmountFilled
+                    fee
+                }}
+            }}
+            """
+
+            while True:
+                query = query_template.format(
+                    batch_size=self.batch_size,
+                    cursor=cursor_timestamp,
+                    end=chunk_end
+                )
+
+                try:
+                    async with self._semaphore:
+                        result = await self._query(query)
+
+                    batch = result.get("orderFilledEvents", [])
+                    if not batch:
+                        break
+
+                    # Put batch in queue (blocks if queue is full)
+                    await queue.put(batch)
+                    
+                    cursor_timestamp = batch[-1]["timestamp"]
+                    
+                    if len(batch) < self.batch_size:
+                        break
+                    if int(cursor_timestamp) >= chunk_end:
+                        break
+                except Exception as e:
+                    logger.error(f"Error in fetch worker: {e}")
+                    # Don't break immediately on transient error, retry logic is in _query
+                    # But if _query fails after retries, it raises.
+                    # We should probably catch here to avoid killing the worker entirely?
+                    # But _query raises on catastrophic failure.
+                    # Let's break loop on error to avoid infinite loops
+                    break
+
+        # Start workers
+        # We need to track how many workers are active so consumer knows when to stop
+        workers = [asyncio.create_task(fetch_worker(start, end)) for start, end in chunks]
+        
+        # Consumer logic
+        active_workers = len(workers)
+        
+        # We need to know when all workers are done.
+        # Can use a separate task to wait for workers and put a sentinel, or just track logic.
+        # Cleaner: Use a coordinator task that waits for all workers and then puts None.
+        
+        async def coordinator():
+            await asyncio.gather(*workers, return_exceptions=True)
+            await queue.put(None) # Sentinel
+
+        coord_task = asyncio.create_task(coordinator())
+
+        while True:
+            # Get next batch
+            item = await queue.get()
+            
+            if item is None:
+                # Sentinel received, we are done
+                break
+                
+            yield item
+            
+        # Cleanup (if user breaks loop early)
+        if not coord_task.done():
+            coord_task.cancel()
+            for w in workers:
+                w.cancel()
+
     async def get_trades_for_period(
         self,
         days: int = 7,
@@ -474,37 +597,42 @@ class GoldskyClient:
             maker_amount = float(event.get("makerAmountFilled", 0)) / 1e6  # USDC has 6 decimals
             taker_amount = float(event.get("takerAmountFilled", 0)) / 1e6
 
-            # Determine side based on asset IDs
-            # Maker asset is what maker gives, taker asset is what taker gives
+            # Derive side: makerAssetId == 0 means maker gives USDC (BUY), else SELL
             maker_asset = event.get("makerAssetId", "")
             taker_asset = event.get("takerAssetId", "")
 
-            # Extract market ID from asset ID (format: conditionId-outcomeIndex)
-            # The asset ID contains the condition ID which is the market ID
-            market_id = ""
-            if maker_asset:
-                # Asset ID format varies, try to extract condition ID
-                market_id = maker_asset.split("-")[0] if "-" in maker_asset else maker_asset
-            elif taker_asset:
-                market_id = taker_asset.split("-")[0] if "-" in taker_asset else taker_asset
+            is_maker_usdc = maker_asset == "" or maker_asset == "0"
+            side = "BUY" if is_maker_usdc else "SELL"
 
-            # Calculate price and size
-            # In a prediction market, one side is USDC and other is outcome tokens
-            if maker_amount > 0 and taker_amount > 0:
-                # Price = USDC amount / token amount
-                # Need to determine which is which based on asset types
-                size = max(maker_amount, taker_amount)
-                price = min(maker_amount, taker_amount) / size if size > 0 else 0
+            # Determine market ID from the non-USDC asset
+            market_id = ""
+            if not is_maker_usdc:
+                market_id = maker_asset.split("-")[0] if "-" in maker_asset else maker_asset
+            elif taker_asset and taker_asset != "0":
+                taker_id = taker_asset.split("-")[0] if "-" in taker_asset else taker_asset
+                market_id = taker_id
+
+            # Price = usdc_amount / token_amount
+            if is_maker_usdc:
+                usdc_amount = maker_amount
+                token_amount = taker_amount
             else:
+                usdc_amount = taker_amount
+                token_amount = maker_amount
+
+            if token_amount > 0:
+                price = usdc_amount / token_amount
+                size = token_amount
+            else:
+                price = 0.5
                 size = maker_amount or taker_amount
-                price = 0.5  # Default if can't determine
 
             # Normalize price to 0-1 range
-            if price > 1:
-                price = 1 / price if price > 0 else 0.5
+            price = max(0, min(1, price))  # Clamp to [0, 1]
 
             return {
                 "trade_id": event["id"],
+                "source": "goldsky",  # Track source
                 "tx_hash": event.get("transactionHash", ""),
                 "timestamp": datetime.fromtimestamp(timestamp, tz=timezone.utc),
                 "market_id": market_id,
@@ -513,7 +641,8 @@ class GoldskyClient:
                 "size": size,
                 "price": price,
                 "notional": size * price,
-                "side": "BUY",  # Will need more context to determine
+                "side": side,
+                "outcome": "",  # Will need more context
                 "outcome": "",  # Will need more context
                 "fee": float(event.get("fee", 0)) / 1e6,
             }

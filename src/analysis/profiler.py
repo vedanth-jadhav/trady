@@ -694,6 +694,10 @@ class WalletProfileBuilder:
             avg_trade_size=behavior.avg_trade_size,
             max_trade_size=behavior.max_trade_size,
 
+            # Performance
+            sharpe_ratio=behavior.sharpe_ratio,
+            early_exit_ratio=behavior.early_exit_ratio,
+
             # Scores
             preliminary_insider_score=insider_score,
             negative_signal_score=0.0,  # Computed below

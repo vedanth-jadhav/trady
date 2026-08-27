@@ -13,7 +13,7 @@ import socket
 import ssl
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 import logging
 
 import aiohttp
@@ -241,28 +241,39 @@ class PolymarketClient:
         logger.info(f"Fetched {len(all_markets)} markets")
         return all_markets
 
-    async def get_events(self, limit: int = 100, offset: int = 0) -> List[Dict]:
+    async def get_events(self, limit: int = 100, offset: int = 0, active: Optional[bool] = None) -> List[Dict]:
         """
         Fetch events from Gamma API (contains market metadata).
 
         Args:
             limit: Number of events to fetch
             offset: Pagination offset
+            active: Filter by active status (True/False). If None, fetches all.
 
         Returns:
             List of event dictionaries with nested markets
         """
-        params = {"limit": limit, "offset": offset, "active": "true"}
+        params = {"limit": limit, "offset": offset}
+        if active is not None:
+            params["active"] = "true" if active else "false"
+            
         return await self._request(
             "GET", "/events", params=params, base_url=self.GAMMA_API_URL
         )
 
-    async def get_all_events(self, max_events: int = 1000) -> List[Dict]:
+    async def get_all_events(
+        self,
+        max_events: int = 1000,
+        active: Optional[bool] = None,
+        progress_callback: Optional[Callable[[int], None]] = None
+    ) -> List[Dict]:
         """
         Fetch all events with pagination.
 
         Args:
             max_events: Maximum number of events to fetch
+            active: Filter by activity status
+            progress_callback: Callback(fetched_count)
 
         Returns:
             List of all event dictionaries
@@ -272,13 +283,18 @@ class PolymarketClient:
         limit = 100
 
         while len(all_events) < max_events:
-            events = await self.get_events(limit=limit, offset=offset)
+            events = await self.get_events(limit=limit, offset=offset, active=active)
 
             if not events:
                 break
 
             all_events.extend(events)
             offset += limit
+
+            if progress_callback:
+                progress_callback(len(all_events))
+            else:
+                logger.info(f"Fetched {len(all_events)} events...")
 
             if len(events) < limit:
                 break

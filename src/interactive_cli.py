@@ -41,6 +41,11 @@ from src.analysis.cli import (
     run_analysis,
 )
 
+from src.ml.cli import (
+    train as ml_train,
+    score as ml_score,
+)
+
 app = typer.Typer(
     name="trady",
     help="Interactive CLI for Trady - Polymarket Insider Detection Bot",
@@ -138,6 +143,7 @@ def interactive():
             choices=[
                 "📊 Data Pipeline - Fetch and prepare data",
                 "🔍 Analysis Pipeline - Analyze wallets and detect insiders",
+                "🤖 ML Pipeline - Train model and score trades",
                 "📈 Quick View - Show data info",
                 "✅ Validate Data - Check data integrity",
                 "⚙️  Individual Commands - Run specific commands",
@@ -154,6 +160,8 @@ def interactive():
             run_data_pipeline_interactive()
         elif "Analysis Pipeline" in main_choice:
             run_analysis_pipeline_interactive()
+        elif "ML Pipeline" in main_choice:
+            run_ml_pipeline_interactive()
         elif "Quick View" in main_choice:
             data_info(data_dir=Path("data/processed"))
         elif "Validate Data" in main_choice:
@@ -390,6 +398,59 @@ def run_analysis_pipeline_interactive():
                     )
 
 
+
+def run_ml_pipeline_interactive():
+    """Interactive workflow for ML pipeline."""
+    check_questionary()
+
+    console.print("\n[bold cyan]ML Pipeline Configuration[/bold cyan]\n")
+
+    while True:
+        action = questionary.select(
+            "Select ML action:",
+            choices=[
+                "🏋️  Train Model (XGBoost)",
+                "🎯 Score Trades",
+                "⬅️  Back to Main Menu",
+            ],
+            style=custom_style,
+        ).ask()
+
+        if action is None or "Back" in action:
+            break
+
+        if "Train Model" in action:
+            confirm = questionary.confirm(
+                "Train new model? This will overwrite existing models.",
+                default=True
+            ).ask()
+            
+            if confirm:
+                try:
+                    ml_train(
+                        data_dir=Path("data/processed"),
+                        output_model=Path("data/models/insider_model.joblib")
+                    )
+                except Exception as e:
+                    console.print(f"[red]Training failed: {e}[/red]")
+
+        elif "Score Trades" in action:
+            confirm = questionary.confirm(
+                "Score trades using existing model?",
+                default=True
+            ).ask()
+            
+            if confirm:
+                try:
+                    ml_score(
+                        data_dir=Path("data/processed"),
+                        model_path=Path("data/models/insider_model.joblib"),
+                        output_file=Path("data/processed/scored_trades.parquet")
+                    )
+                except Exception as e:
+                    console.print(f"[red]Scoring failed: {e}[/red]")
+
+
 def run_individual_commands():
     """Menu for running individual commands."""
     check_questionary()
@@ -400,6 +461,7 @@ def run_individual_commands():
             choices=[
                 "📊 Data Commands",
                 "🔍 Analysis Commands",
+                "🤖 ML Commands",
                 "⬅️  Back to Main Menu",
             ],
             style=custom_style,
@@ -443,6 +505,20 @@ def run_individual_commands():
 
             if cmd and cmd != "⬅️  Back":
                 execute_analysis_command(cmd)
+
+        elif "ML Commands" in category:
+            cmd = questionary.select(
+                "Select ML command:",
+                choices=[
+                    "train",
+                    "score",
+                    "⬅️  Back",
+                ],
+                style=custom_style,
+            ).ask()
+
+            if cmd and cmd != "⬅️  Back":
+                execute_ml_command(cmd)
 
 
 def execute_data_command(cmd: str):
@@ -530,6 +606,22 @@ def execute_analysis_command(cmd: str):
             data_dir=Path("data/processed"),
             output_dir=Path("data/processed"),
             top_n=top
+        )
+
+
+
+def execute_ml_command(cmd: str):
+    """Execute an ML command."""
+    if cmd == "train":
+        ml_train(
+            data_dir=Path("data/processed"),
+            output_model=Path("data/models/insider_model.joblib")
+        )
+    elif cmd == "score":
+        ml_score(
+            data_dir=Path("data/processed"),
+            model_path=Path("data/models/insider_model.joblib"),
+            output_file=Path("data/processed/scored_trades.parquet")
         )
 
 

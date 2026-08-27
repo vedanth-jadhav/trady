@@ -229,6 +229,17 @@ class DataStorage:
             safe_id = market_id[:16].replace("/", "_").replace("\\", "_")
             filename = f"trades_{safe_id}.parquet"
 
+        # Check in trades_data directory if default filename
+        if filename == "trades.parquet":
+            dir_path = self.base_path / "trades_data"
+            if dir_path.exists() and dir_path.is_dir():
+                try:
+                    df = pd.read_parquet(dir_path)
+                    logger.info(f"Loaded {len(df)} trades from dataset {dir_path}")
+                    return df
+                except Exception as e:
+                    logger.warning(f"Failed to load dataset {dir_path}: {e}")
+
         path = self._get_path(filename)
         if not path.exists():
             logger.warning(f"File not found: {path}")

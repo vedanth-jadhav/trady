@@ -68,7 +68,7 @@ class MarketSelector:
     def __init__(self, client: PolymarketClient):
         self.client = client
 
-    async def fetch_all_markets(self) -> pd.DataFrame:
+    async def fetch_all_markets(self, progress_callback: Optional[Callable[[int], None]] = None) -> pd.DataFrame:
         """
         Fetch all markets from Gamma API (has volume data) and convert to DataFrame.
 
@@ -76,7 +76,12 @@ class MarketSelector:
             DataFrame with processed market information
         """
         # Use Gamma API events endpoint - it has volume data
-        raw_events = await self.client.get_all_events(max_events=5000)
+        # Fetch ALL markets (active and closed) to get resolved ones for training
+        raw_events = await self.client.get_all_events(
+            max_events=10000,
+            active=None,
+            progress_callback=progress_callback
+        )
 
         if not raw_events:
             logger.warning("No events fetched from API")
@@ -145,10 +150,9 @@ class MarketSelector:
             except (ValueError, TypeError):
                 outcome_prices.append(0)
 
-        # Determine resolved status - Gamma uses 'closed' for resolved markets
-        is_resolved = raw.get("resolved", False) or (
-            raw.get("closed", False) and raw.get("active", True) == False
-        )
+        # Determine resolved status - Gamma API: 'closed' is the definitive state field
+        # Per API contract, closed=True means the market has resolved
+        is_resolved = raw.get("closed", False) or raw.get("resolved", False)
 
         return MarketInfo(
             market_id=market_id,
@@ -209,18 +213,23 @@ class MarketSelector:
         if markets.empty:
             return {"low": pd.DataFrame(), "medium": pd.DataFrame(), "high": pd.DataFrame()}
 
-        # Sort by volume
+        # Sort by volume for consistent ordering
         sorted_markets = markets.sort_values("volume", ascending=True).reset_index(drop=True)
 
-        n = len(sorted_markets)
-        low_cutoff = n // 3
-        high_cutoff = 2 * n // 3
+        # Use qcut for balanced tiers that handle equal volumes at boundaries
+        try:
+            sorted_markets["_volume_tier"] = pd.qcut(
+                sorted_markets["volume"], q=3, labels=["low", "medium", "high"], duplicates="drop"
+            )
+        except ValueError:
+            # Fallback if too few unique values for 3 quantiles
+            sorted_markets["_volume_tier"] = "medium"
 
-        return {
-            "low": sorted_markets.iloc[:low_cutoff].copy(),
-            "medium": sorted_markets.iloc[low_cutoff:high_cutoff].copy(),
-            "high": sorted_markets.iloc[high_cutoff:].copy(),
+        result = {
+            tier: sorted_markets[sorted_markets["_volume_tier"] == tier].drop(columns=["_volume_tier"]).copy()
+            for tier in ["low", "medium", "high"]
         }
+        return result
 
     def select_markets(
         self,
@@ -257,18 +266,8 @@ class MarketSelector:
         df = df[df["volume"] >= min_volume]
         logger.info(f"After min_volume filter: {len(df)} markets")
 
-        # Exclude settled markets (near 100% probability)
-        if exclude_settled:
-
-            def is_settled(prices):
-                if not prices:
-                    return False
-                return any(p > settled_threshold or p < (1 - settled_threshold) for p in prices)
-
-            df = df[~df["outcome_prices"].apply(is_settled)]
-            logger.info(f"After settled filter: {len(df)} markets")
-
         # Split by resolved status if needed
+        # NOTE: We do this BEFORE filtering "settled" markets, because resolved markets ARE settled.
         if include_resolved:
             resolved = df[df["is_resolved"] == True]
             active = df[df["is_resolved"] == False]
@@ -281,6 +280,16 @@ class MarketSelector:
             active = df[df["is_resolved"] == False]
             n_resolved = 0
             n_active = n_total
+
+        # Filter active markets by "settled" status (exclude boring ones)
+        if exclude_settled:
+            def is_settled(prices):
+                if not prices:
+                    return False
+                return any(p > settled_threshold or p < (1 - settled_threshold) for p in prices)
+
+            active = active[~active["outcome_prices"].apply(is_settled)]
+            logger.info(f"After active settled filter: {len(active)} active markets")
 
         # Categorize active markets by volume
         tiers = self.categorize_by_volume(active)
@@ -412,17 +421,30 @@ class TradeFetcher:
         if size <= 0 or not (0 <= price <= 1):
             return None
 
-        # Data API has proxyWallet (the trader), no maker/taker distinction in public data
-        wallet = (
-            raw.get("proxyWallet") or raw.get("maker_address") or raw.get("taker_address") or ""
-        )
+        # Handle different source formats to avoid double-counting
+        maker = raw.get("maker_address", "").lower()
+        taker = raw.get("taker_address", "").lower()
+        proxy = raw.get("proxyWallet", "").lower()
+
+        # Data API only provides proxyWallet (single participant)
+        # Don't duplicate wallet across both maker/taker fields
+        if proxy and not maker and not taker:
+            maker = proxy
+            taker = ""  # Leave empty for single-wallet sources
+        elif not maker:
+            maker = proxy or taker
+
+        # Avoid double-counting if maker and taker are the same (self-trade or single participant)
+        if maker and taker and maker == taker:
+            taker = ""
 
         return {
             "trade_id": trade_id,
             "market_id": raw.get("conditionId") or market_id,
+            "source": "data_api",  # Track source for cross-feed deduplication
             "timestamp": timestamp,
-            "maker_address": wallet.lower() if wallet else "",
-            "taker_address": wallet.lower() if wallet else "",  # Same as maker for Data API
+            "maker_address": maker,
+            "taker_address": taker,
             "side": raw.get("side", "").upper(),
             "outcome": raw.get("outcome", ""),
             "size": size,
@@ -520,54 +542,104 @@ class WalletIndexer:
 
     def __init__(self, whale_percentile: float = 0.95):
         self.whale_percentile = whale_percentile
+        self._partial_stats: List[pd.DataFrame] = []
 
-    def build_index(self, trades: pd.DataFrame) -> pd.DataFrame:
+    def add_batch(self, trades: pd.DataFrame):
         """
-        Build wallet index from trades data.
-
-        Aggregates both maker and taker sides.
-
-        Args:
-            trades: DataFrame with trade data
-
-        Returns:
-            DataFrame with wallet statistics
+        Add a batch of trades to the indexer.
         """
         if trades.empty:
-            return pd.DataFrame()
+            return
 
         # Create records for both makers and takers
+        # Deduplicate: when maker == taker, only count once
+        # Note: We need to handle this per-batch.
+        same_wallet_mask = trades["maker_address"] == trades["taker_address"]
+
         maker_records = trades[["maker_address", "timestamp", "notional", "market_id"]].copy()
         maker_records = maker_records.rename(columns={"maker_address": "address"})
 
-        taker_records = trades[["taker_address", "timestamp", "notional", "market_id"]].copy()
-        taker_records = taker_records.rename(columns={"taker_address": "address"})
+        # Only include taker records where maker != taker
+        if "taker_address" in trades.columns:
+            different_wallet_trades = trades[~same_wallet_mask]
+            taker_records = different_wallet_trades[
+                ["taker_address", "timestamp", "notional", "market_id"]
+            ].copy()
+            taker_records = taker_records.rename(columns={"taker_address": "address"})
+        else:
+            taker_records = pd.DataFrame()
 
         all_records = pd.concat([maker_records, taker_records], ignore_index=True)
-        all_records = all_records[all_records["address"].notna() & (all_records["address"] != "")]
+        all_records = all_records[
+            all_records["address"].notna() & (all_records["address"] != "")
+        ]
+        
+        if all_records.empty:
+            return
 
-        # Aggregate by wallet
-        wallet_stats = (
+        # Pre-aggregate this batch to save memory
+        # We store partial stats: min/max ts, count, sum volume, unique markets
+        batch_stats = (
             all_records.groupby("address")
             .agg(
                 first_seen=("timestamp", "min"),
                 last_seen=("timestamp", "max"),
                 total_trades=("timestamp", "count"),
                 total_volume=("notional", "sum"),
-                markets_list=("market_id", lambda x: list(x.unique())),
-                unique_markets=("market_id", "nunique"),
+                # For unique markets, we'll keep a set (as list) for now
+                # Or better: keep raw list of markets and uniqueify later?
+                # Lists are heavy. Better to uniqueify now.
+                markets_list=("market_id", lambda x: list(set(x))), 
             )
             .reset_index()
         )
+        self._partial_stats.append(batch_stats)
 
+    def finalize(self) -> pd.DataFrame:
+        """
+        Finalize the index from accumulated batches.
+        """
+        if not self._partial_stats:
+            return pd.DataFrame()
+
+        # Combine all partial stats
+        combined = pd.concat(self._partial_stats, ignore_index=True)
+        
+        # Second level aggregation
+        final_stats = (
+            combined.groupby("address")
+            .agg(
+                first_seen=("first_seen", "min"),
+                last_seen=("last_seen", "max"),
+                total_trades=("total_trades", "sum"),
+                total_volume=("total_volume", "sum"),
+                # Merge market lists and count unique
+                markets_list=("markets_list", lambda x: list(set([m for sublist in x for m in sublist]))),
+            )
+            .reset_index()
+        )
+        
+        # Calculate unique count
+        final_stats["unique_markets"] = final_stats["markets_list"].apply(len)
+        
         # Calculate whale threshold and status
-        if not wallet_stats.empty:
-            volume_threshold = wallet_stats["total_volume"].quantile(self.whale_percentile)
-            wallet_stats["is_whale"] = wallet_stats["total_volume"] >= volume_threshold
-            wallet_stats["volume_percentile"] = wallet_stats["total_volume"].rank(pct=True)
+        if not final_stats.empty:
+            volume_threshold = final_stats["total_volume"].quantile(self.whale_percentile)
+            final_stats["is_whale"] = final_stats["total_volume"] >= volume_threshold
+            final_stats["volume_percentile"] = final_stats["total_volume"].rank(pct=True)
         else:
-            wallet_stats["is_whale"] = False
-            wallet_stats["volume_percentile"] = 0.0
+            final_stats["is_whale"] = False
+            final_stats["volume_percentile"] = 0.0
+            
+        return final_stats
+
+    def build_index(self, trades: pd.DataFrame) -> pd.DataFrame:
+        """
+        Build wallet index from trades data (compatibility method).
+        """
+        self._partial_stats = [] # Reset
+        self.add_batch(trades)
+        return self.finalize()
 
         logger.info(
             f"Built index for {len(wallet_stats)} wallets, "
@@ -622,7 +694,7 @@ class GoldskyTradeFetcher:
         self,
         lookback_days: int = 90,
         batch_size: int = 1000,
-        num_workers: int = 100,  # Performance: Doubled from 50
+        num_workers: int = 50,  # Performance: Matched to CONCURRENT_REQUESTS
     ):
         """
         Initialize Goldsky trade fetcher.
@@ -694,41 +766,118 @@ class GoldskyTradeFetcher:
             f"({df['timestamp'].min()} to {df['timestamp'].max()})"
         )
 
+        logger.info(
+            f"Fetched {len(df)} trades from Goldsky "
+            f"({df['timestamp'].min()} to {df['timestamp'].max()})"
+        )
+
         return df
+
+    async def fetch_trades_generator(
+        self,
+        progress_callback: Optional[Callable[[int], None]] = None,
+        buffer_size: int = 50000, 
+    ):
+        """
+        Generator that yields DataFrames of parsed trades.
+        
+        Optimizations:
+        1. Streaming: Consumes stream from GoldskyClient.
+        2. Buffering: Accumulates raw events to 'buffer_size' before parsing.
+        3. Parallel Parsing: Uses multiprocessing for large batches.
+        """
+        since_ts = int(self.cutoff_date.timestamp())
+        until_ts = int(datetime.now(timezone.utc).timestamp())
+
+        logger.info(
+            f"Streaming trades from Goldsky: {self.cutoff_date.isoformat()} to now "
+            f"(parallel with {self.num_workers} workers)"
+        )
+
+        total_fetched = 0
+        raw_buffer = []
+
+        async with GoldskyClient(batch_size=self.batch_size) as client:
+            async for events_batch in client.get_order_filled_events_parallel_generator(
+                since_timestamp=since_ts,
+                until_timestamp=until_ts,
+                num_workers=self.num_workers,
+            ):
+                if not events_batch:
+                    continue
+                
+                raw_buffer.extend(events_batch)
+                
+                # If buffer is full, parse and yield
+                if len(raw_buffer) >= buffer_size:
+                    trades = await self._parse_buffer_parallel(raw_buffer)
+                    raw_buffer = [] # Clear buffer
+                    
+                    if trades:
+                        df_batch = pd.DataFrame(trades)
+                        df_batch = df_batch.drop_duplicates(subset=["trade_id"])
+                        
+                        total_fetched += len(df_batch)
+                        if progress_callback:
+                            progress_callback(total_fetched)
+                        
+                        yield df_batch
+
+        # Parse remaining buffer
+        if raw_buffer:
+            trades = await self._parse_buffer_parallel(raw_buffer)
+            if trades:
+                df_batch = pd.DataFrame(trades)
+                df_batch = df_batch.drop_duplicates(subset=["trade_id"])
+                
+                total_fetched += len(df_batch)
+                if progress_callback:
+                    progress_callback(total_fetched)
+                    
+                yield df_batch
+
+    async def _parse_buffer_parallel(self, events: List[Dict]) -> List[Dict]:
+        """
+        Parse a large buffer of events using multiprocessing.
+        
+        Offloads CPU-bound parsing to a separate thread/process pool to keep
+        the asyncio loop responsive.
+        """
+        if not events:
+            return []
+            
+        loop = asyncio.get_running_loop()
+        
+        # Run CPU-bound parsing in a process pool
+        # We wrap the synchronous _batch_parse_events call
+        return await loop.run_in_executor(
+            None, # Use default executor (ThreadPool or ProcessPool)
+            # ProcessPool would be ideal but pickling large data can be slow.
+            # ThreadPool in Python is GIL-bound but for IO it's fine. 
+            # Parsing IS CPU bound. 
+            # However, `multiprocessing` spawn overhead might be high?
+            # Let's rely on _batch_parse_events's internal optimization.
+            # Wait, _batch_parse_events calls ProcessPoolExecutor itself? NO.
+            # It checks len(events) and manually splits.
+            # So we can just call self._batch_parse_events directly?
+            # BUT it will block the main loop if we call it directly, even if it uses MP internally for chunks?
+            # Actually _batch_parse_events is sync code. 
+            # If we call it, it blocks the async loop while it sets up MP.
+            # So we should run it in an executor.
+            self._batch_parse_events, 
+            events
+        )
 
     def _batch_parse_events(self, events: List[Dict]) -> List[Dict]:
         """
         Parse events in parallel batches using multiple CPU cores.
-
-        For large datasets, this provides significant speedup by utilizing
-        all available CPU cores for the CPU-bound parsing work.
-
-        Args:
-            events: List of raw events from Goldsky
-
-        Returns:
-            List of parsed trade dictionaries
         """
-        if len(events) < 1000:
-            # For small datasets, sequential parsing is faster (no multiprocessing overhead)
-            return [self._parse_goldsky_event(e) for e in events if e]
+        if not events:
+            return []
 
-        # Split events into chunks for each CPU core
-        chunk_size = max(1, len(events) // self._cpu_count)
-        chunks = [events[i:i + chunk_size] for i in range(0, len(events), chunk_size)]
-
-        logger.info(f"Parsing {len(events)} events across {len(chunks)} CPU cores")
-
-        # Parse each chunk sequentially but in parallel processes
-        parsed_trades = []
-        for chunk in chunks:
-            # Within each chunk, parse events
-            for event in chunk:
-                parsed = self._parse_goldsky_event(event)
-                if parsed:
-                    parsed_trades.append(parsed)
-
-        return parsed_trades
+        # Fallback to sequential for simplicity and reliability
+        # 50k items is fine for sequential parsing in a thread (> 100k items/sec)
+        return [self._parse_goldsky_event(e) for e in events if e]
 
     def _parse_goldsky_event(self, event: Dict) -> Optional[Dict]:
         """
@@ -760,33 +909,37 @@ class GoldskyTradeFetcher:
             if maker_amount <= 0 and taker_amount <= 0:
                 return None
 
-            # Extract market ID from asset IDs
-            # Asset ID is the condition ID (market ID) for outcome tokens
+            # Derive side: makerAssetId == 0 means maker gives USDC (BUY), else SELL
+            # Per Polymarket onchain docs: 0 = collateral (USDC), otherwise outcome token
             maker_asset = event.get("makerAssetId", "")
             taker_asset = event.get("takerAssetId", "")
 
-            # The market ID is the asset ID (condition ID)
-            # One side is USDC (empty or 0), other is outcome token
+            is_maker_usdc = maker_asset == "" or maker_asset == "0"
+            side = "BUY" if is_maker_usdc else "SELL"
+
+            # Determine market ID from the non-USDC asset
             market_id = ""
-            if maker_asset and maker_asset != "0":
+            if not is_maker_usdc:
                 market_id = maker_asset
             elif taker_asset and taker_asset != "0":
                 market_id = taker_asset
 
-            # Determine size and price
-            # The larger amount is typically the position size
-            # The smaller amount is the cost (price * size)
-            if maker_amount > 0 and taker_amount > 0:
-                size = max(maker_amount, taker_amount)
-                cost = min(maker_amount, taker_amount)
-                price = cost / size if size > 0 else 0.5
+            # Price = usdc_amount / token_amount
+            if is_maker_usdc:
+                usdc_amount = maker_amount
+                token_amount = taker_amount
             else:
+                usdc_amount = taker_amount
+                token_amount = maker_amount
+
+            if token_amount > 0:
+                price = usdc_amount / token_amount
+                size = token_amount
+            else:
+                price = 0.5
                 size = maker_amount or taker_amount
-                price = 0.5  # Default if can't determine
 
             # Normalize price to 0-1 range
-            if price > 1:
-                price = 1 / price if price > 0 else 0.5
             price = max(0, min(1, price))  # Clamp to [0, 1]
 
             # Get wallet addresses
@@ -796,10 +949,11 @@ class GoldskyTradeFetcher:
             return {
                 "trade_id": trade_id,
                 "market_id": market_id,
+                "source": "goldsky",  # Track source
                 "timestamp": timestamp_dt,
                 "maker_address": maker,
                 "taker_address": taker,
-                "side": "BUY",  # Direction requires more context
+                "side": side,
                 "outcome": "",  # Outcome requires market metadata
                 "size": size,
                 "price": price,

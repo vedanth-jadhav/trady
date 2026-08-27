@@ -313,9 +313,9 @@ class InsiderSignalDetector:
                 progress_callback(100, 100)
             return []
 
-        # Filter trades to suspicious wallets only
+        # Filter trades where EITHER maker or taker is suspicious
         df = self.trades_df
-        mask = df["maker_address"].isin(high_potential_wallets)
+        mask = df["maker_address"].isin(high_potential_wallets) | df["taker_address"].isin(high_potential_wallets)
         filtered_trades = df[mask]
 
         if max_trades and len(filtered_trades) > max_trades:
@@ -332,110 +332,123 @@ class InsiderSignalDetector:
             return []
 
         for i, row in enumerate(filtered_trades.itertuples(index=False)):
-            wallet = row.maker_address
-            scores = wallet_scores.get(wallet)
+            # Check both maker and taker
+            # A trade can have two suspicious wallets
+            sides_to_process = []
+            
+            maker = getattr(row, "maker_address", "")
+            if maker in high_potential_wallets:
+                sides_to_process.append((maker, "maker"))
+                
+            taker = getattr(row, "taker_address", "")
+            if taker in high_potential_wallets:
+                sides_to_process.append((taker, "taker"))
 
-            if not scores:
-                continue
+            for wallet, role in sides_to_process:
+                scores = wallet_scores.get(wallet)
+                if not scores:
+                    continue
 
-            profile = scores["profile"]
+                profile = scores["profile"]
 
-            # Create trade object
-            trade = Trade(
-                trade_id=str(getattr(row, 'trade_id', '')),
-                market_id=str(getattr(row, 'market_id', '')),
-                timestamp=row.timestamp,
-                wallet=wallet,
-                side=str(getattr(row, 'side', '')),
-                outcome=str(getattr(row, 'outcome', '')),
-                size=float(getattr(row, 'size', 0)),
-                price=float(getattr(row, 'price', 0)),
-                notional=float(getattr(row, 'notional', 0)),
-                tx_hash=getattr(row, 'tx_hash', None),
-            )
-
-            # Get market
-            market = self._markets_lookup.get(trade.market_id)
-            if not market:
-                market = Market(
-                    market_id=trade.market_id,
-                    question="",
-                    category="Unknown",
-                    volume=0,
-                    liquidity=0,
-                    is_resolved=False,
+                # Create trade object (adjusting side/size if necessary for perspective)
+                # Note: Trade object assumes 'wallet' is the primary actor
+                trade = Trade(
+                    trade_id=str(getattr(row, 'trade_id', '')),
+                    market_id=str(getattr(row, 'market_id', '')),
+                    timestamp=row.timestamp,
+                    wallet=wallet,
+                    side=str(getattr(row, 'side', '')),
+                    outcome=str(getattr(row, 'outcome', '')),
+                    size=float(getattr(row, 'size', 0)),
+                    price=float(getattr(row, 'price', 0)),
+                    notional=float(getattr(row, 'notional', 0)),
+                    tx_hash=getattr(row, 'tx_hash', None),
                 )
 
-            # Build signals
-            all_signals = []
+                # Get market
+                market = self._markets_lookup.get(trade.market_id)
+                if not market:
+                    market = Market(
+                        market_id=trade.market_id,
+                        question="",
+                        category="Unknown",
+                        volume=0,
+                        liquidity=0,
+                        is_resolved=False,
+                    )
 
-            # Freshness signals
-            if scores["freshness"] >= 0.5:
-                from .types import FreshnessSignalType, SignalCategory, Signal
-                if profile.total_trades == 1:
-                    sig_type = FreshnessSignalType.ZERO_HISTORY
-                elif profile.days_on_polymarket < 7:
-                    sig_type = FreshnessSignalType.NEW_WALLET
-                else:
-                    sig_type = FreshnessSignalType.RECENT_FUNDING
+                # Build signals
+                all_signals = []
 
-                all_signals.append(Signal(
-                    type=sig_type,
-                    category=SignalCategory.FRESHNESS,
-                    confidence=scores["freshness"],
-                    details={
-                        "days_on_platform": profile.days_on_polymarket,
-                        "total_trades": profile.total_trades,
-                    }
-                ))
+                # Freshness signals
+                if scores["freshness"] >= 0.5:
+                    from .types import FreshnessSignalType, SignalCategory, Signal
+                    if profile.total_trades == 1:
+                        sig_type = FreshnessSignalType.ZERO_HISTORY
+                    elif profile.days_on_polymarket < 7:
+                        sig_type = FreshnessSignalType.NEW_WALLET
+                    else:
+                        sig_type = FreshnessSignalType.RECENT_FUNDING
 
-            # Funding signals
-            if scores["funding"] >= 0.5:
-                from .types import FundingSignalType
-                if scores["funding"] >= 0.9:
-                    sig_type = FundingSignalType.PRIVACY_FUNDING
-                elif scores["funding"] >= 0.7:
-                    sig_type = FundingSignalType.TRACKED_WALLET_FUNDING
-                else:
-                    sig_type = FundingSignalType.BRIDGE_FUNDING
+                    all_signals.append(Signal(
+                        type=sig_type,
+                        category=SignalCategory.FRESHNESS,
+                        confidence=scores["freshness"],
+                        details={
+                            "days_on_platform": profile.days_on_polymarket,
+                            "total_trades": profile.total_trades,
+                        }
+                    ))
 
-                all_signals.append(Signal(
-                    type=sig_type,
-                    category=SignalCategory.FUNDING,
-                    confidence=scores["funding"],
-                    details={"source": profile.primary_funding_source}
-                ))
+                # Funding signals
+                if scores["funding"] >= 0.5:
+                    from .types import FundingSignalType
+                    if scores["funding"] >= 0.9:
+                        sig_type = FundingSignalType.PRIVACY_FUNDING
+                    elif scores["funding"] >= 0.7:
+                        sig_type = FundingSignalType.TRACKED_WALLET_FUNDING
+                    else:
+                        sig_type = FundingSignalType.BRIDGE_FUNDING
 
-            # Sizing signals (trade-specific)
-            sizing_signals = self.sizing_detector.detect(trade, profile, market)
-            all_signals.extend(sizing_signals)
+                    all_signals.append(Signal(
+                        type=sig_type,
+                        category=SignalCategory.FUNDING,
+                        confidence=scores["funding"],
+                        details={"source": profile.primary_funding_source}
+                    ))
 
-            # Must have at least one signal
-            if not all_signals:
-                continue
+                # Sizing signals (trade-specific)
+                sizing_signals = self.sizing_detector.detect(trade, profile, market)
+                all_signals.extend(sizing_signals)
 
-            # Market context
-            market_context = self.market_analyzer.compute_market_boost(market)
+                # Must have at least one signal
+                if not all_signals:
+                    continue
 
-            # Aggregate
-            aggregated = self.aggregator.aggregate(
-                all_signals, scores["negative"], market_context
-            )
+                # Market context
+                market_context = self.market_analyzer.compute_market_boost(market)
 
-            if aggregated.final_score >= min_score:
-                results.append(TradeSignal(
-                    trade=trade,
-                    wallet_profile=profile,
-                    signals=all_signals,
-                    aggregated=aggregated,
-                    final_score=aggregated.final_score,
-                ))
+                # Aggregate
+                aggregated = self.aggregator.aggregate(
+                    all_signals, scores["negative"], market_context
+                )
+
+                if aggregated.final_score >= min_score:
+                    results.append(TradeSignal(
+                        trade=trade,
+                        wallet_profile=profile,
+                        signals=all_signals,
+                        aggregated=aggregated,
+                        final_score=aggregated.final_score,
+                    ))
 
             if progress_callback and (i % 1000 == 0 or i == total - 1):
                 pct = int(((total_wallets + i) / (total_wallets + total)) * 100)
                 progress_callback(pct, 100)
-
-        results.sort(key=lambda x: x.final_score, reverse=True)
+            
+            # Sort results strictly at the end
+            results.sort(key=lambda x: x.final_score, reverse=True)
 
         logger.info(f"Detected {len(results)} signals above threshold {min_score}")
 

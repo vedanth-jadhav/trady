@@ -139,6 +139,10 @@ class WalletProfile:
     avg_trade_size: float = 0.0
     max_trade_size: float = 0.0
 
+    # Performance
+    sharpe_ratio: Optional[float] = None
+    early_exit_ratio: float = 0.0
+
     # Computed scores
     preliminary_insider_score: float = 0.0
     negative_signal_score: float = 0.0
